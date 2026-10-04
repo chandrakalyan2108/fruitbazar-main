@@ -117,7 +117,8 @@ locals {
 }
 
 resource "aws_iam_role" "github_deploy" {
-  name = "${var.project}-github-deploy"
+  name                 = "${var.project}-github-deploy"
+  max_session_duration = 7200
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
