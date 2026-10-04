@@ -1,0 +1,123 @@
+# FruitBazar on AWS — ECR + ECS Fargate + RDS MySQL, domain on Hostinger
+
+Everything is Terraform. After a one-time setup, every push to `main` builds,
+tests, pushes a Docker image to ECR and rolls it out to Fargate with zero downtime.
+
+```
+                 Hostinger (domain registrar)
+                          │  nameservers / DNS records set by API
+                          ▼
+  users ──HTTPS──► Route 53 / Hostinger DNS ──► ALB (public subnets, ACM TLS cert)
+                                                  │  sticky sessions, :8080
+                                                  ▼
+                                   ECS Fargate tasks (private app subnets)
+                                   Tomcat 9 + JDK 21, autoscaled 2–6
+                                     │ image pull (NAT + S3 endpoint)   │ :3306 TLS
+                                     ▼                                  ▼
+                                   ECR (immutable tags)        RDS MySQL 8.4 (isolated DB subnets)
+                                                               creds in Secrets Manager
+```
+
+## What's in the repo
+
+| Path | Purpose |
+|---|---|
+| `Dockerfile` | Multi-stage: Maven/JDK 21 build → Tomcat 9 runtime, non-root, deployed as `ROOT` |
+| `infra/bootstrap/` | **Run once.** S3 state bucket + GitHub OIDC deploy role |
+| `infra/app/vpc.tf` | VPC, public / app / db subnets in 2 AZs, NAT, S3 gateway endpoint |
+| `infra/app/security_groups.tf` | Internet → ALB(80/443) → ECS(8080) → RDS(3306), nothing else |
+| `infra/app/ecr.tf` | ECR repo, scan on push, lifecycle cleanup |
+| `infra/app/rds.tf` | RDS MySQL, encrypted, TLS-only, backups, generated password in Secrets Manager |
+| `infra/app/alb.tf` | ALB, target group (health check `/health`, sticky sessions), HTTP→HTTPS |
+| `infra/app/dns.tf` | ACM certificate + Hostinger automation (Route 53 delegation **or** Hostinger DNS records) |
+| `infra/app/ecs.tf` | Cluster, task definition, service (circuit-breaker rollback), CPU autoscaling, IAM |
+| `scripts/hostinger-dns.sh` | Hostinger API calls (nameservers, DNS records, forwarding) |
+| `scripts/deploy.sh` | Same deploy as CI, from your laptop |
+| `.github/workflows/deploy.yml` | CI/CD pipeline |
+
+## One-time setup (≈15 minutes of your time)
+
+**1. Hostinger API token** — hPanel → *Account* → *API* → create a token.
+
+**2. Bootstrap AWS** (needs admin credentials on your laptop, once):
+```bash
+cd infra/bootstrap
+cp terraform.tfvars.example terraform.tfvars    # set github_repository
+terraform init && terraform apply
+```
+Keep the generated local `terraform.tfstate` safe (it only tracks the bucket and role).
+If the account already has a GitHub OIDC provider, set `create_github_oidc_provider = false`.
+
+**3. GitHub settings** → *Settings → Secrets and variables → Actions* (the bootstrap
+output prints the exact values):
+
+| Type | Name | Value |
+|---|---|---|
+| Variable | `AWS_REGION` | `ap-south-1` |
+| Variable | `TF_STATE_BUCKET` | from bootstrap output |
+| Variable | `AWS_DEPLOY_ROLE_ARN` | from bootstrap output |
+| Variable | `DOMAIN_NAME` | e.g. `fruitbazar.in` (leave unset to test on the ALB hostname over HTTP) |
+| Variable | `DNS_MODE` | `route53` or `hostinger` (see below) |
+| Secret | `HOSTINGER_API_TOKEN` | token from step 1 |
+
+Also create an environment named **`production`** (*Settings → Environments*). You can add
+required reviewers there if you want a manual approval before each deploy.
+
+**4. Push to `main`.** That's it. The first run takes ~20–30 minutes (RDS creation and
+certificate validation are the slow parts); later deploys take ~5 minutes.
+
+## Choosing a DNS mode
+
+**`route53` (default, recommended)** — Terraform creates a Route 53 hosted zone and
+switches your domain's nameservers at Hostinger to it via the API. Both
+`https://fruitbazar.in` and `https://www.fruitbazar.in` work. **Catch:** any records you had
+in Hostinger's DNS stop resolving — if you use Hostinger email, re-create its MX/TXT records
+with `additional_dns_records` (example in `terraform.tfvars.example`).
+
+**`hostinger`** — DNS stays at Hostinger and nothing existing is touched. Terraform upserts a
+`www` CNAME → ALB and the ACM validation CNAME through the API, and 301-forwards the bare domain
+to `https://www.…`. (A CNAME can't live on the apex, which is why the site is served on `www`.)
+
+## Local deploy (optional)
+```bash
+export TF_STATE_BUCKET=... HOSTINGER_API_TOKEN=...
+cp infra/app/terraform.tfvars.example infra/app/terraform.tfvars   # edit
+./scripts/deploy.sh
+```
+
+## Database
+The app now uses MySQL when `DB_HOST` is set (always on AWS) and falls back to the original
+in-memory behaviour when it isn't, so `mvn package` + local Tomcat still works.
+
+- On startup `DatabaseInitializer` creates `users`, `orders`, `order_items` (idempotent) and
+  seeds the `demo / demo123` account with a PBKDF2 hash.
+- Every checkout is saved to `orders` / `order_items` in one transaction.
+- Credentials are generated by Terraform, stored in Secrets Manager, and injected by ECS.
+  RDS only accepts TLS connections and only from the Fargate security group.
+
+Connect for debugging (ECS Exec, no bastion needed):
+```bash
+aws ecs execute-command --cluster fruitbazar-prod-cluster --task <task-id> \
+  --container app --interactive --command "/bin/bash"
+```
+
+## Operations
+- **Logs:** CloudWatch → `/ecs/fruitbazar-prod`
+- **Rollback:** failed deploys roll back automatically (ECS circuit breaker, and the pipeline
+  fails). To pin an older version: re-run the workflow for an older commit, or
+  `TF_VAR_image_tag=<old sha> terraform apply`.
+- **Scaling:** CPU target tracking at 60 %, 2–6 tasks (`min_capacity` / `max_capacity`).
+- **Cost (rough, ap-south-1, defaults):** ALB, one NAT gateway, 2 × (0.5 vCPU / 1 GB) Fargate
+  tasks and a `db.t4g.micro` RDS — on the order of US$100–130/month. The NAT gateway is a big
+  part; check the AWS pricing calculator for current numbers.
+- **Teardown:** set `db_deletion_protection = false`, apply, then `terraform destroy`
+  (a final DB snapshot is kept unless `db_skip_final_snapshot = true`).
+
+## Things to know
+- Sessions (cart, login) are in Tomcat memory, so the ALB uses **sticky sessions**. A user
+  pinned to a task that gets replaced during a deploy loses their cart. Moving sessions to
+  ElastiCache/Redis would remove that limitation.
+- The demo account and the "demo / demo123" hint on `login.jsp` are still there — remove both
+  before real customers use the site. There is no registration page yet.
+- The Terraform state contains the generated DB password; the state bucket is private,
+  encrypted, versioned and TLS-only.

@@ -1,0 +1,15 @@
+target/
+*.war
+.idea/
+*.iml
+.vscode/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+terraform.tfvars
+!infra/**/terraform.tfvars.example

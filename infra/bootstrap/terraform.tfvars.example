@@ -1,0 +1,3 @@
+aws_region        = "ap-south-1"
+project           = "fruitbazar"
+github_repository = "chandrakalyan2108/fruitbazar"

@@ -1,0 +1,185 @@
+name: Build & Deploy (ECR + ECS Fargate)
+
+# push to main  -> test -> terraform (ECR) -> build/push image -> terraform (everything) -> smoke test
+# pull request  -> test -> terraform plan (no changes applied)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # GitHub OIDC -> AWS IAM role (no stored AWS keys)
+  contents: read
+
+concurrency:
+  group: fruitbazar-${{ github.ref }}
+  cancel-in-progress: false   # never interrupt a running terraform apply
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  TF_DIR: infra/app
+  TF_VERSION: 1.10.5
+  IMAGE_TAG: ${{ github.sha }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_VAR_aws_region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+  TF_VAR_dns_mode: ${{ vars.DNS_MODE || 'route53' }}
+  TF_VAR_image_tag: ${{ github.sha }}
+  # Read by scripts/hostinger-dns.sh (never stored in Terraform state)
+  HOSTINGER_API_TOKEN: ${{ secrets.HOSTINGER_API_TOKEN }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  test:
+    name: Maven build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - run: mvn -B clean package
+
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Terraform plan (PR)
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=fruitbazar/prod.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+      - name: Format & validate
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform fmt -check -recursive
+          terraform validate
+      - name: Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform plan -lock-timeout=5m -no-color
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to AWS
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 120   # first run waits for RDS (~10 min) and the TLS certificate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false   # so `terraform output -raw` works in scripts
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=fruitbazar/prod.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      # Stage 1: the ECR repo must exist before an image can be pushed to it
+      - name: Ensure ECR repository
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform apply -auto-approve -lock-timeout=5m \
+            -target=aws_ecr_repository.app -target=aws_ecr_lifecycle_policy.app
+          echo "ECR_URL=$(terraform output -raw ecr_repository_url)" >> "$GITHUB_ENV"
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Check whether this commit's image already exists
+        id: exists
+        run: |
+          if aws ecr describe-images --repository-name "${ECR_URL##*/}" \
+               --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build & push image
+        if: steps.exists.outputs.found != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.ECR_URL }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      # Stage 2: everything else (VPC, SGs, RDS, ALB, ACM, DNS, ECS). Blocks until
+      # the new tasks are healthy behind the load balancer.
+      - name: Terraform apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -auto-approve -lock-timeout=5m
+
+      - name: Verify the new version is the one running
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          CLUSTER=$(terraform output -raw ecs_cluster_name)
+          SERVICE=$(terraform output -raw ecs_service_name)
+          EXPECTED=$(terraform output -raw task_definition_arn)
+          RUNNING=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query "services[0].deployments[?status=='PRIMARY'].taskDefinition | [0]" --output text)
+          echo "expected: $EXPECTED"
+          echo "running:  $RUNNING"
+          if [ "$EXPECTED" != "$RUNNING" ]; then
+            echo "::error::ECS circuit breaker rolled the deployment back - check CloudWatch logs"
+            exit 1
+          fi
+
+      - name: Smoke test
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          URL=$(terraform output -raw app_url)
+          ALB=$(terraform output -raw alb_dns_name)
+          echo "### Deployed :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- URL: $URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`$ECR_URL:$IMAGE_TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          # Hit the ALB directly so the check doesn't depend on DNS caches
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' -k "http://$ALB/health" -L || echo 000)
+            echo "attempt $i: HTTP $CODE"
+            [ "$CODE" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::error::Health check failed"; exit 1

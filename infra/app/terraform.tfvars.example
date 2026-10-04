@@ -1,0 +1,29 @@
+# Copy to terraform.tfvars for LOCAL runs (CI passes these as TF_VAR_* env vars).
+# Never commit terraform.tfvars.
+
+aws_region  = "ap-south-1"
+project     = "fruitbazar"
+environment = "prod"
+
+# Your domain registered at Hostinger. Leave "" to test on the ALB hostname (HTTP).
+domain_name = "fruitbazar.in"
+dns_mode    = "route53" # or "hostinger"
+
+# hostinger mode only
+# app_subdomain          = "www"
+# hostinger_forward_apex = true
+
+# route53 mode only: re-create Hostinger email records, if you use Hostinger email
+# additional_dns_records = [
+#   { name = "", type = "MX",  ttl = 3600, records = ["5 mx1.hostinger.com", "10 mx2.hostinger.com"] },
+#   { name = "", type = "TXT", ttl = 3600, records = ["v=spf1 include:_spf.mail.hostinger.com ~all"] },
+# ]
+
+# Sizing
+task_cpu          = 512
+task_memory       = 1024
+desired_count     = 2
+min_capacity      = 2
+max_capacity      = 6
+db_instance_class = "db.t4g.micro"
+db_multi_az       = false
